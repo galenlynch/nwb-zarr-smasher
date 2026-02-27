@@ -8,25 +8,45 @@
 ![Python](https://img.shields.io/badge/python->=3.10-blue?logo=python)
 
 ## Usage
- - To use this template, click the green `Use this template` button and `Create new repository`.
- - After github initially creates the new repository, please wait an extra minute for the initialization scripts to finish organizing the repo.
- - To enable the automatic semantic version increments: in the repository go to `Settings` and `Collaborators and teams`. Click the green `Add people` button. Add `svc-aindscicomp` as an admin. Modify the file in `.github/workflows/tag_and_publish.yml` and remove the if statement in line 65. The semantic version will now be incremented every time a code is committed into the main branch.
- - To publish to PyPI, enable semantic versioning and uncomment the publish block in `.github/workflows/tag_and_publish.yml`. The code will now be published to PyPI every time the code is committed into the main branch.
- - The `.github/workflows/test_and_lint.yml` file will run automated tests and style checks every time a Pull Request is opened. If the checks are undesired, the `test_and_lint.yml` can be deleted. The strictness of the code coverage level, etc., can be modified by altering the configurations in the `pyproject.toml` file and the `.flake8` file.
- - Please make any necessary updates to the README.md and CITATION.cff files
+Minimal usage: smash_nwb
 
-## Level of Support
-Please indicate a level of support:
- - [ ] Supported: We are releasing this code to the public as a tool we expect others to use. Issues are welcomed, and we expect to address them promptly; pull requests will be vetted by our staff before inclusion.
- - [ ] Occasional updates: We are planning on occasional updating this tool with no fixed schedule. Community involvement is encouraged through both issues and pull requests.
- - [ ] Unsupported: We are not currently supporting this code, but simply releasing it to the community AS IS but are not able to provide any guarantees of support. The community is welcome to submit issues, but you should not expect an active response.
+The smash_nwb function provides a one-shot workflow to:
 
-## Release Status
-GitHub's tags and Release features can be used to indicate a Release status.
+Convert Bonsai behavior JSON → behavior NWB
 
- - Stable: v1.0.0 and above. Ready for production.
- - Beta:  v0.x.x or indicated in the tag. Ready for beta testers and early adopters.
- - Alpha: v0.x.x or indicated in the tag. Still in early development.
+Merge behavior into a sorted ephys NWB/Zarr
+
+Inject electrode annotations from IBL app output
+
+(Optional) Align timestamps using HARP
+
+(Optional) Add sniff detector acquisition
+
+Example
+from nwb_zarr_smasher.smash import smash_nwb
+
+out_path = smash_nwb(
+    ephys_sorted_name="ecephys_XXXX_YYYY_sorted_ZZZZ",
+    beh_json="/data/path/to/behavior.json",
+    ibl_app_output="/results/path/to/ibl_app_output",
+
+    # optional
+    do_harp_alignment=False,
+    harp_channel=5,
+    sniffing_folder=None,
+)
+
+print("Merged NWB written to:", out_path)
+Required inputs
+Parameter	Description
+ephys_sorted_name	Name of the sorted ephys dataset folder under /data
+beh_json	Path to Bonsai behavior JSON
+ibl_app_output	Directory containing IBL app probe annotations
+Optional inputs
+Parameter	Description
+do_harp_alignment	Run HARP timestamp realignment
+harp_channel	Digital line used for HARP clock
+sniffing_folder	Folder containing SniffDetector__32.bin files (only used if provided)
 
 ## Installation
 To use the software, in the root directory, run
