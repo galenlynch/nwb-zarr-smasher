@@ -23,6 +23,7 @@ Inject electrode annotations from IBL app output
 (Optional) Add sniff detector acquisition
 
 Example
+```
 from nwb_zarr_smasher.smash import smash_nwb
 
 out_path = smash_nwb(
@@ -35,8 +36,8 @@ out_path = smash_nwb(
     harp_channel=5,
     sniffing_folder=None,
 )
-
 print("Merged NWB written to:", out_path)
+```
 Required inputs
 Parameter	Description
 ephys_sorted_name	Name of the sorted ephys dataset folder under /data
