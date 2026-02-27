@@ -1,50 +1,77 @@
 [build-system]
-requires = ["setuptools"]
+requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "nwb-zarr-smasher"
 description = "Generated from aind-library-template"
-license = {text = "MIT"}
+license = { text = "MIT" }
 requires-python = ">=3.10"
-authors = [
-    {name = "Allen Institute for Neural Dynamics"}
-]
-classifiers = [
-    "Programming Language :: Python :: 3"
-]
+authors = [{ name = "Allen Institute for Neural Dynamics" }]
+classifiers = ["Programming Language :: Python :: 3"]
 readme = "README.md"
 dynamic = ["version"]
 
 dependencies = [
+  # ---- NWB / schema ----
+  "aind-data-schema",
+  "pynwb",
+  "hdmf-zarr",
+  "neuroconv",
+
+  # ---- data stack ----
+  "pandas",
+  "xarray",
+  "pytz",
+  "tzdata",
+
+  # ---- ephys / spikeinterface ----
+  "spikeinterface[full,widgets]",
+  "wavpack-numcodecs",
+
+  # ---- git / source installs ----
+  "ndx-pose @ git+https://github.com/rly/ndx-pose.git",
+  "dynamic-foraging-task @ git+https://github.com/AllenNeuralDynamics/dynamic-foraging-task.git",
+  "harp-python @ git+https://github.com/jsiegle/harp-python@decode-clock",
+
+  # ---- AIND utilities ----
+  "aind_dynamic_foraging_data_utils",
+  "aind-ephys-utils",
+
+  # ---- tooling with known constraints ----
+  "open-ephys-python-tools<0.6.0",
+  "pydantic-yaml<1.4",
+
+  # ---- misc scientific ----
+  "ibllib",
+  "SimpleITK",
 ]
 
 [dependency-groups]
 dev = [
-    'black',
-    'coverage',
-    'flake8',
-    'interrogate',
-    'isort',
-    'Sphinx',
-    'furo'
+  "black",
+  "coverage",
+  "flake8",
+  "interrogate",
+  "isort",
+  "Sphinx",
+  "furo",
 ]
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.dynamic]
-version = {attr = "nwb_zarr_smasher.__version__"}
+version = { attr = "nwb_zarr_smasher.__version__" }
 
 [tool.black]
 line-length = 79
-target_version = ['py310']
+target_version = ["py310"]
 exclude = '''
-
 (
   /(
-      \.eggs         # exclude a few common directories in the
-    | \.git          # root of the project
+      \.eggs
+    | \.git
     | \.hg
     | \.mypy_cache
     | \.tox
@@ -64,10 +91,10 @@ source = ["nwb_zarr_smasher", "tests"]
 
 [tool.coverage.report]
 exclude_lines = [
-    "if __name__ == .__main__.:",
-    "^from .* import .*",
-    "^import .*",
-    "pragma: no cover"
+  "if __name__ == .__main__.:",
+  "^from .* import .*",
+  "^import .*",
+  "pragma: no cover",
 ]
 fail_under = 100
 
