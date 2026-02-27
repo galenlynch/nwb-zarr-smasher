@@ -39,15 +39,21 @@ out_path = smash_nwb(
 print("Merged NWB written to:", out_path)
 ```
 Required inputs
-Parameter	Description
-ephys_sorted_name	Name of the sorted ephys dataset folder under /data
-beh_json	Path to Bonsai behavior JSON
-ibl_app_output	Directory containing IBL app probe annotations
+
+ephys_sorted_name:	Name of the sorted ephys dataset folder under /data
+
+beh_json:	Path to Bonsai behavior JSON
+
+ibl_app_output:	Directory containing IBL app probe annotations
+
+
 Optional inputs
-Parameter	Description
-do_harp_alignment	Run HARP timestamp realignment
-harp_channel	Digital line used for HARP clock
-sniffing_folder	Folder containing SniffDetector__32.bin files (only used if provided)
+do_harp_alignment:Run HARP timestamp realignment
+
+harp_channel:Digital line used for HARP clock
+
+sniffing_folder:Folder containing SniffDetector__32.bin files (only used if provided)
+
 
 ## Installation
 To use the software, in the root directory, run
