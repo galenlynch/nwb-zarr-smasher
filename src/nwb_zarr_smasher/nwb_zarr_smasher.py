@@ -53,12 +53,29 @@ from harp.clock import align_timestamps_to_anchor_points, decode_harp_clock
 from matplotlib import pyplot as plt
 
 from hdmf_zarr import NWBZarrIO
+import SimpleITK as sitk
 
 #: Per-probe file the IBL alignment GUI writes with each channel already warped
 #: into CCF. The GUI's companion ``channel_locations.json`` is SPIM-native and
 #: is deliberately not read here -- see
 #: :func:`update_electrodes_table_locations_from_ibl_app`.
 CCF_CHANNEL_LOCATIONS = 'ccf_channel_locations.json'
+
+#: Allen CCF reference, from the ``allen_mouse_ccf`` data asset. 25 um matches
+#: the resolution the SPIM-to-CCF registration was computed at; reading the
+#: 10 um volume would imply a precision the transform does not have.
+DEFAULT_CCF_ROOT = '/data/allen_mouse_ccf'
+CCF_ANNOTATION_RELPATH = 'annotation/ccf_2017/annotation_25.nii.gz'
+CCF_STRUCTURES_RELPATH = 'annotation/adult_mouse_ccf_structures.csv'
+
+#: The annotation's index order, as SimpleITK reports it. Asserted at load: a
+#: differently-oriented atlas must raise, not mirror every coordinate.
+CCF_INDEX_ORIENTATION = 'PIR'
+
+#: Annotation value for "no structure here". It is the only label in the
+#: volume with no row in the structures CSV. Note 997 (``root``) is a *real*
+#: label meaning "in the brain but unassigned", and is not this.
+CCF_ID_NO_STRUCTURE = 0
 
 
 # --- IO helpers (Zarr vs HDF5, and clean copy) ---
@@ -464,7 +481,84 @@ def write_new_unit_timestamps_to_file(nwb_path,new_units_table):
 
 
 # Merge electrodes table with IBL app output
-def update_electrodes_table_locations_from_ibl_app(nwb_output_path,ibl_annotations_path):
+def _load_ccf_reference(ccf_root):
+    """Load the CCF annotation volume and its structure table.
+
+    Parameters
+    ----------
+    ccf_root : str or Path
+        Mount of the ``allen_mouse_ccf`` data asset.
+
+    Returns
+    -------
+    tuple[SimpleITK.Image, dict[int, dict]]
+        The annotation volume, and ``{ccf_id: {acronym, name,
+        structure_id_path}}``.
+
+    Raises
+    ------
+    ValueError
+        If the annotation's index order is not
+        :data:`CCF_INDEX_ORIENTATION`, since the micrometre conversion below
+        assumes it.
+    """
+    ccf_root = Path(ccf_root)
+    annotation = sitk.ReadImage(str(ccf_root / CCF_ANNOTATION_RELPATH))
+    orientation = sitk.DICOMOrientImageFilter_GetOrientationFromDirectionCosines(
+        annotation.GetDirection()
+    )
+    if orientation != CCF_INDEX_ORIENTATION:
+        raise ValueError(
+            f"CCF annotation is oriented {orientation}, expected "
+            f"{CCF_INDEX_ORIENTATION}; the index-to-micrometre conversion would "
+            "mirror every coordinate."
+        )
+
+    table = pd.read_csv(ccf_root / CCF_STRUCTURES_RELPATH)
+    structures = {
+        int(row.id): {
+            'ccf_acronym': row.acronym,
+            'ccf_name': row.name,
+            'ccf_structure_id_path': row.structure_id_path,
+        }
+        for row in table.itertuples(index=False)
+    }
+    return annotation, structures
+
+
+def _ccf_structure_at(annotation, structures, continuous_index_pir):
+    """Return the CCF structure fields at a continuous index, and whether it is inside.
+
+    Outside the volume gives ``CCF_ID_NO_STRUCTURE``, same as background inside
+    it: the box is a storage crop enclosing the whole brain, so beyond it is
+    known to be outside tissue, not unknown. Padding the file with background
+    voxels must not change the answer.
+
+    Bounds are tested explicitly, not by catching an exception --
+    ``TransformPhysicalPointToContinuousIndex`` is arithmetic and returns
+    out-of-range indices without complaint.
+
+    Returns
+    -------
+    tuple[dict, bool]
+        The ``ccf_*`` fields, and whether the index fell inside the volume.
+    """
+    index = [int(round(value)) for value in continuous_index_pir]
+    inside = all(0 <= i < size for i, size in zip(index, annotation.GetSize()))
+    ccf_id = int(annotation.GetPixel(index)) if inside else CCF_ID_NO_STRUCTURE
+    fields = {
+        'ccf_id': ccf_id,
+        'ccf_acronym': None,
+        'ccf_name': None,
+        'ccf_structure_id_path': None,
+    }
+    fields.update(structures.get(ccf_id, {}))
+    return fields, inside
+
+
+def update_electrodes_table_locations_from_ibl_app(
+    nwb_output_path, ibl_annotations_path, ccf_root=DEFAULT_CCF_ROOT
+):
     """Merge the alignment GUI's per-channel CCF locations into the electrodes table.
 
     Reads ``ccf_channel_locations.json`` from each probe folder under
@@ -472,24 +566,13 @@ def update_electrodes_table_locations_from_ibl_app(nwb_output_path,ibl_annotatio
     table on ``(group_name, channel_name)``, where ``group_name`` is the probe
     folder's name.
 
-    There used to be a fallback: probes without that file were read from the
-    GUI's other output, ``channel_locations.json``, and pushed through
-    ``iblatlas``' ``AllenAtlas.xyz2ccf``. It was removed because it could not
-    have worked, in two independent ways.
+    Regions are looked up in the CCF annotation volume, not taken from the
+    GUI's ``brain_region_id``, which it derives from labels warped into mouse
+    space and so disagrees with CCF space.
 
-    ``channel_locations.json`` holds **SPIM-native** coordinates -- the GUI
-    writes ``brain_atlas.unrotate_to_spim_native(...)``, this mouse's own
-    lightsheet image space, not an atlas frame. ``xyz2ccf`` expects IBL
-    bregma-relative atlas coordinates, so the registration the GUI performed was
-    simply skipped. Separately the values are micrometres (the GUI scales by
-    1e6) while ``xyz2ccf`` expects metres, overshooting by a factor of 1e6.
-    Every channel therefore raised ``ValueError``, hit a ``[0, 0, 0]``
-    substitution, and was then handed to ``GetPixel`` -- which returned the real
-    label at the CCF world origin. The output was uniform garbage carrying a
-    plausible region name.
-
-    Nothing here can reconstruct the GUI's warp, so a probe missing the CCF file
-    is now an error rather than something to paper over.
+    A probe without the CCF file is an error: only the alignment GUI can
+    produce these coordinates. Its companion ``channel_locations.json`` is
+    SPIM-native and cannot substitute.
 
     Parameters
     ----------
@@ -501,8 +584,10 @@ def update_electrodes_table_locations_from_ibl_app(nwb_output_path,ibl_annotatio
     Returns
     -------
     pandas.DataFrame
-        The electrodes table with ``brain_region_id``, ``ccf_ml``, ``ccf_ap``,
-        ``ccf_dv`` merged in and ``brain_region`` renamed to ``location``.
+        The electrodes table with ``ccf_ml``/``ccf_ap``/``ccf_dv`` (PIR
+        micrometres) and ``ccf_id``/``ccf_acronym``/``ccf_name``/
+        ``ccf_structure_id_path`` merged in, and ``location`` set from
+        ``ccf_acronym``.
 
     Raises
     ------
@@ -519,12 +604,19 @@ def update_electrodes_table_locations_from_ibl_app(nwb_output_path,ibl_annotatio
 
     electrode_names = os.listdir(ibl_annotations_path)
 
+    annotation, structures = _load_ccf_reference(ccf_root)
+    # Index order is PIR (asserted at load), so index * spacing is PIR microns.
+    # Taken from the image rather than hardcoded signs, so a reoriented atlas
+    # trips the assertion instead of mirroring silently.
+    microns_per_index_pir = np.asarray(annotation.GetSpacing()) * 1000.0
+
     # One dict per channel rather than seven parallel lists. The lists could
     # desync: group_name/channel_name were appended before the coordinate was
     # computed, so any early exit between the two left the columns at unequal
     # lengths and silently shifted every later channel's coordinate by one row.
     rows = []
     missing = []
+    outside_by_probe = {}
 
     for elect in electrode_names:
         ccf_path = os.path.join(ibl_annotations_path, elect, CCF_CHANNEL_LOCATIONS)
@@ -535,19 +627,38 @@ def update_electrodes_table_locations_from_ibl_app(nwb_output_path,ibl_annotatio
         with open(ccf_path, 'r') as O:
             ccf_json = json.load(O)
 
+        outside_by_probe[elect] = [0, len(ccf_json)]
         for channel_id in ccf_json:
+            channel = ccf_json[channel_id]
+            # The GUI writes ITK world coordinates -- LPS millimetres in the CCF
+            # template's own physical space -- so this point needs no conversion
+            # to index the annotation. SimpleITK is always LPS millimetres.
+            point_lps_millimeters = (
+                float(channel['x']), float(channel['y']), float(channel['z'])
+            )
+            continuous_index_pir = annotation.TransformPhysicalPointToContinuousIndex(
+                point_lps_millimeters
+            )
+            posterior_microns, inferior_microns, right_microns = (
+                np.asarray(continuous_index_pir) * microns_per_index_pir
+            )
+            structure, inside_volume = _ccf_structure_at(
+                annotation, structures, continuous_index_pir
+            )
+            if not inside_volume:
+                outside_by_probe[elect][0] += 1
+
             rows.append({
                 'group_name': elect,
                 'channel_name': 'CH' + channel_id.split('_')[-1],
-                'brain_region_id': ccf_json[channel_id]['brain_region_id'],
-                'brain_region': ccf_json[channel_id]['brain_region'],
-                # NOTE: these are the GUI's CCF *LPS millimetres* scaled to
-                # micrometres, so ccf_ml and ccf_ap carry the opposite sign to
-                # their names (+x is left, +y is posterior). Left as-is pending
-                # a decision on the target convention.
-                'ccf_ml': ccf_json[channel_id]['x'] * 1000,
-                'ccf_ap': ccf_json[channel_id]['y'] * 1000,
-                'ccf_dv': ccf_json[channel_id]['z'] * 1000,
+                # PIR micrometres from the volume's anterior-superior-left
+                # corner. Position in the atlas box only -- the brain floats
+                # inside it, so positive says nothing about being in tissue.
+                # Test ``ccf_id != CCF_ID_NO_STRUCTURE`` for that.
+                'ccf_ml': right_microns,
+                'ccf_ap': posterior_microns,
+                'ccf_dv': inferior_microns,
+                **structure,
             })
 
     if missing:
@@ -562,12 +673,26 @@ def update_electrodes_table_locations_from_ibl_app(nwb_output_path,ibl_annotatio
         "read %d channel(s) of CCF locations from %d probe(s): %s",
         len(rows), len(electrode_names), sorted(electrode_names),
     )
+    for probe, (outside, total) in sorted(outside_by_probe.items()):
+        if outside == total:
+            # An entirely off-atlas probe is an alignment failure, not a shank
+            # sticking out; it would otherwise be a silent probe of ccf_id 0.
+            logger.warning(
+                "probe %s: all %d channel(s) fall outside the CCF volume; "
+                "check its alignment", probe, total,
+            )
+        elif outside:
+            logger.info(
+                "probe %s: %d/%d channel(s) outside the CCF volume",
+                probe, outside, total,
+            )
 
     # Explicit columns so an empty ``rows`` still yields a frame the merge can
     # join against instead of raising KeyError on the missing keys.
     df = pd.DataFrame(rows, columns=['group_name', 'channel_name',
-                                     'brain_region_id', 'brain_region',
-                                     'ccf_ml', 'ccf_ap', 'ccf_dv'])
+                                     'ccf_ml', 'ccf_ap', 'ccf_dv',
+                                     'ccf_id', 'ccf_acronym', 'ccf_name',
+                                     'ccf_structure_id_path'])
 
     # # Rename electrodes to match the units ephys
     # F = {'-1-1':'-2','-1-2':'-3','-1-3':'-4',}
@@ -578,17 +703,17 @@ def update_electrodes_table_locations_from_ibl_app(nwb_output_path,ibl_annotatio
     #             this_loc = df.group_name.loc[ii]
     #             df.group_name.loc[ii] = this_loc.split(findkey)[0]+chngkey
     
-    merged = (
-        pd.merge(
-            electrodes,
-            df,
-            on=["group_name", "channel_name"],
-            how="left",
-            suffixes=("_electrodes", "_df")
-        )
-        .drop(columns=["location"], errors="ignore")   # remove old "location" if present
-        .rename(columns={"brain_region": "location"})  # rename brain_region → location
-    )
+    merged = pd.merge(
+        electrodes,
+        df,
+        on=["group_name", "channel_name"],
+        how="left",
+        suffixes=("_electrodes", "_df"),
+    ).drop(columns=["location"], errors="ignore")  # drop the metadata-derived one
+
+    # NWB requires ``location``; the ``ccf_*`` columns are the authoritative
+    # ones. NaN here is resolved by ``_safe_location`` at write time.
+    merged["location"] = merged["ccf_acronym"]
 
     return merged
 
