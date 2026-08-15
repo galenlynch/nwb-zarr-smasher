@@ -14,8 +14,10 @@ from pynwb import  NWBHDF5IO,NWBFile
 from pathlib import Path
 import pandas as pd
 import numpy as np
-import utils
+import logging
 import shutil
+
+logger = logging.getLogger(__name__)
 
 import aind_dynamic_foraging_data_utils.nwb_utils as nwb_utils
 from aind_ephys_utils.align import align_to_events
@@ -50,10 +52,13 @@ from harp.clock import align_timestamps_to_anchor_points, decode_harp_clock
 
 from matplotlib import pyplot as plt
 
-from iblatlas.atlas import AllenAtlas
-import SimpleITK as sitk
-
 from hdmf_zarr import NWBZarrIO
+
+#: Per-probe file the IBL alignment GUI writes with each channel already warped
+#: into CCF. The GUI's companion ``channel_locations.json`` is SPIM-native and
+#: is deliberately not read here -- see
+#: :func:`update_electrodes_table_locations_from_ibl_app`.
+CCF_CHANNEL_LOCATIONS = 'ccf_channel_locations.json'
 
 
 # --- IO helpers (Zarr vs HDF5, and clean copy) ---
@@ -460,10 +465,52 @@ def write_new_unit_timestamps_to_file(nwb_path,new_units_table):
 
 # Merge electrodes table with IBL app output
 def update_electrodes_table_locations_from_ibl_app(nwb_output_path,ibl_annotations_path):
+    """Merge the alignment GUI's per-channel CCF locations into the electrodes table.
+
+    Reads ``ccf_channel_locations.json`` from each probe folder under
+    *ibl_annotations_path* and left-merges the result onto the NWB's electrodes
+    table on ``(group_name, channel_name)``, where ``group_name`` is the probe
+    folder's name.
+
+    There used to be a fallback: probes without that file were read from the
+    GUI's other output, ``channel_locations.json``, and pushed through
+    ``iblatlas``' ``AllenAtlas.xyz2ccf``. It was removed because it could not
+    have worked, in two independent ways.
+
+    ``channel_locations.json`` holds **SPIM-native** coordinates -- the GUI
+    writes ``brain_atlas.unrotate_to_spim_native(...)``, this mouse's own
+    lightsheet image space, not an atlas frame. ``xyz2ccf`` expects IBL
+    bregma-relative atlas coordinates, so the registration the GUI performed was
+    simply skipped. Separately the values are micrometres (the GUI scales by
+    1e6) while ``xyz2ccf`` expects metres, overshooting by a factor of 1e6.
+    Every channel therefore raised ``ValueError``, hit a ``[0, 0, 0]``
+    substitution, and was then handed to ``GetPixel`` -- which returned the real
+    label at the CCF world origin. The output was uniform garbage carrying a
+    plausible region name.
+
+    Nothing here can reconstruct the GUI's warp, so a probe missing the CCF file
+    is now an error rather than something to paper over.
+
+    Parameters
+    ----------
+    nwb_output_path : str or Path
+        The merged NWB (hdmf-zarr) to read the electrodes table from.
+    ibl_annotations_path : str or Path
+        Directory whose immediate children are probe folders.
+
+    Returns
+    -------
+    pandas.DataFrame
+        The electrodes table with ``brain_region_id``, ``ccf_ml``, ``ccf_ap``,
+        ``ccf_dv`` merged in and ``brain_region`` renamed to ``location``.
+
+    Raises
+    ------
+    FileNotFoundError
+        If any probe folder lacks ``ccf_channel_locations.json``.
     """
-    Moving Prose
-    """
-    
+
+
     # Read copied NWB
     io = NWBZarrIO(str(nwb_output_path), "r+")
     ephys_nwb = io.read()
@@ -472,75 +519,56 @@ def update_electrodes_table_locations_from_ibl_app(nwb_output_path,ibl_annotatio
 
     electrode_names = os.listdir(ibl_annotations_path)
 
-    group_name = []
-    channel_name = []
-    brain_region_id = []
-    location = []
-    ccf_ml = []
-    ccf_ap = []
-    ccf_dv = []
-    
-    atlas = None
-    
-    for ii,elect in enumerate(electrode_names):
-        try: # Histology space file format
-            with open(os.path.join(ibl_annotations_path,elect,'ccf_channel_locations.json'),'r') as O:
-                ccf_json = json.load(O)
-    
-            for jj,channel_id in enumerate(ccf_json.keys()):
-                group_name.append(elect)
-                channel_name.append('CH'+channel_id.split('_')[-1])
-                brain_region_id.append(ccf_json[channel_id]['brain_region_id'])
-                location.append(ccf_json[channel_id]['brain_region'])
-                
-                #ccf_mlapdv = np.array([ccf_json[channel_id]['x'],ccf_json[channel_id]['y'],ccf_json[channel_id]['z']])*1000
-                ccf_ml.append(ccf_json[channel_id]['x']*1000)
-                ccf_ap.append(ccf_json[channel_id]['y']*1000)
-                ccf_dv.append(ccf_json[channel_id]['z']*1000)
-        except FileNotFoundError:
-            if not atlas:
-                atlas = AllenAtlas(mock = True)
-                ccf_annotations = sitk.ReadImage('/data/allen_mouse_ccf/annotation/ccf_2017/annotation_10.nii.gz')
-                areas = pd.read_csv('/data/allen_mouse_ccf/annotation/adult_mouse_ccf_structures.csv')
-            try:
-                with open(os.path.join(ibl_annotations_path,elect,'channel_locations.json'),'r') as O:
-                    ccf_json = json.load(O)
-            except FileNotFoundError:
-                continue
-            for jj,channel_id in enumerate(ccf_json.keys()):
-                if 'origin' in channel_id:
-                    continue
-                group_name.append(elect)
-                channel_name.append('CH'+channel_id.split('_')[-1])
-    
-                try:
-                    ccf_mlapdv = atlas.xyz2ccf(np.array([ccf_json[channel_id]['x'],ccf_json[channel_id]['y'],ccf_json[channel_id]['z']]),ccf_order='mlapdv')         
-                    #ccf_mlapdv = np.array([ccf_json[channel_id]['x'],ccf_json[channel_id]['y'],ccf_json[channel_id]['z']])*1000
-                except ValueError:
-                    ccf_mlapdv = [0,0,0]
-                ccf_ml.append(-ccf_mlapdv[0])
-                ccf_ap.append(ccf_mlapdv[1])
-                ccf_dv.append(-ccf_mlapdv[2])
-    
-                ccf_mm = np.array([-ccf_mlapdv[0],ccf_mlapdv[1],-ccf_mlapdv[2]])/1000
-                brain_region_number = ccf_annotations.GetPixel(ccf_annotations.TransformPhysicalPointToIndex(ccf_mm))
-                brain_region_id.append(brain_region_number)
-                try:
-                    location.append(areas.acronym.values[list(areas.id.values).index(brain_region_number)])
-                except ValueError:
-                    location.append(str(np.nan))
-    
-            
-    df = pd.DataFrame({'group_name':group_name,
-                       'channel_name':channel_name,
-                       'brain_region_id':brain_region_id,
-                       'brain_region':location,
-                      'ccf_ml':ccf_ml,
-                      'ccf_ap':ccf_ap,
-                      'ccf_dv':ccf_dv,
-    
-                      })
-    
+    # One dict per channel rather than seven parallel lists. The lists could
+    # desync: group_name/channel_name were appended before the coordinate was
+    # computed, so any early exit between the two left the columns at unequal
+    # lengths and silently shifted every later channel's coordinate by one row.
+    rows = []
+    missing = []
+
+    for elect in electrode_names:
+        ccf_path = os.path.join(ibl_annotations_path, elect, CCF_CHANNEL_LOCATIONS)
+        if not os.path.isfile(ccf_path):
+            missing.append(elect)
+            continue
+
+        with open(ccf_path, 'r') as O:
+            ccf_json = json.load(O)
+
+        for channel_id in ccf_json:
+            rows.append({
+                'group_name': elect,
+                'channel_name': 'CH' + channel_id.split('_')[-1],
+                'brain_region_id': ccf_json[channel_id]['brain_region_id'],
+                'brain_region': ccf_json[channel_id]['brain_region'],
+                # NOTE: these are the GUI's CCF *LPS millimetres* scaled to
+                # micrometres, so ccf_ml and ccf_ap carry the opposite sign to
+                # their names (+x is left, +y is posterior). Left as-is pending
+                # a decision on the target convention.
+                'ccf_ml': ccf_json[channel_id]['x'] * 1000,
+                'ccf_ap': ccf_json[channel_id]['y'] * 1000,
+                'ccf_dv': ccf_json[channel_id]['z'] * 1000,
+            })
+
+    if missing:
+        raise FileNotFoundError(
+            f"{len(missing)} probe folder(s) under {ibl_annotations_path} have no "
+            f"{CCF_CHANNEL_LOCATIONS}: {sorted(missing)}. CCF coordinates come from "
+            "the alignment GUI's own warp; there is no way to derive them here. "
+            "Re-export the alignment for these probes."
+        )
+
+    logger.info(
+        "read %d channel(s) of CCF locations from %d probe(s): %s",
+        len(rows), len(electrode_names), sorted(electrode_names),
+    )
+
+    # Explicit columns so an empty ``rows`` still yields a frame the merge can
+    # join against instead of raising KeyError on the missing keys.
+    df = pd.DataFrame(rows, columns=['group_name', 'channel_name',
+                                     'brain_region_id', 'brain_region',
+                                     'ccf_ml', 'ccf_ap', 'ccf_dv'])
+
     # # Rename electrodes to match the units ephys
     # F = {'-1-1':'-2','-1-2':'-3','-1-3':'-4',}
     # for xx,findkey in enumerate(F.keys()):
