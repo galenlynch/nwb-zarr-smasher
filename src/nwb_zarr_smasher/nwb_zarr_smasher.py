@@ -55,11 +55,24 @@ from matplotlib import pyplot as plt
 from hdmf_zarr import NWBZarrIO
 import SimpleITK as sitk
 
-#: Per-probe file the IBL alignment GUI writes with each channel already warped
-#: into CCF. The GUI's companion ``channel_locations.json`` is SPIM-native and
-#: is deliberately not read here -- see
-#: :func:`update_electrodes_table_locations_from_ibl_app`.
-CCF_CHANNEL_LOCATIONS = 'ccf_channel_locations.json'
+#: Per-probe files the IBL alignment GUI writes with each channel already warped
+#: into CCF. A stream carrying several shanks is written one file per shank,
+#: suffixed ``_shank1``..``_shankN``; a single-shank stream gets the bare name.
+#: Both land in the same probe directory and merge into one electrode group. The
+#: GUI's companion ``channel_locations.json`` is SPIM-native and is deliberately
+#: not read here -- see :func:`update_electrodes_table_locations_from_ibl_app`.
+CCF_CHANNEL_LOCATIONS_GLOB = 'ccf_channel_locations*.json'
+
+#: Probe-face coordinates, in micrometres, used to identify a contact. The GUI
+#: writes them as ``lateral``/``axial``; the electrodes table calls the same two
+#: numbers ``rel_x``/``rel_y``.
+CCF_CONTACT_KEY_JSON = ('lateral', 'axial')
+CCF_CONTACT_KEY_NWB = ('rel_x', 'rel_y')
+
+#: Rounding applied to both sides of the contact key before joining. Contact
+#: pitch is tens of micrometres, so 0.1 um separates every real contact while
+#: absorbing any float drift between the two producers.
+CCF_CONTACT_KEY_DECIMALS = 1
 
 #: Allen CCF reference, from the ``allen_mouse_ccf`` data asset. 25 um matches
 #: the resolution the SPIM-to-CCF registration was computed at; reading the
@@ -561,18 +574,26 @@ def update_electrodes_table_locations_from_ibl_app(
 ):
     """Merge the alignment GUI's per-channel CCF locations into the electrodes table.
 
-    Reads ``ccf_channel_locations.json`` from each probe folder under
-    *ibl_annotations_path* and left-merges the result onto the NWB's electrodes
-    table on ``(group_name, channel_name)``, where ``group_name`` is the probe
-    folder's name.
+    Reads every ``ccf_channel_locations*.json`` in each probe folder under
+    *ibl_annotations_path* and left-merges onto the NWB's electrodes table,
+    matching contacts by their position on the probe face -- the GUI's
+    ``lateral``/``axial`` against the table's ``rel_x``/``rel_y`` -- within the
+    electrode group named for the probe folder.
+
+    Position is the join key because it is the only channel identity the GUI
+    writes. Its ``channel_<i>`` keys index a depth-sorted list of every site on
+    the probe, not the recorded channels, so they coincide with channel number
+    only while a recording sits in the lowest bank. Position also separates the
+    shanks of a multi-shank stream, whose per-shank files each restart at
+    ``channel_0`` but carry the shank's offset in ``lateral``.
 
     Regions are looked up in the CCF annotation volume, not taken from the
     GUI's ``brain_region_id``, which it derives from labels warped into mouse
     space and so disagrees with CCF space.
 
-    A probe without the CCF file is an error: only the alignment GUI can
-    produce these coordinates. Its companion ``channel_locations.json`` is
-    SPIM-native and cannot substitute.
+    A probe without a CCF file is an error: only the alignment GUI can produce
+    these coordinates. Its companion ``channel_locations.json`` is SPIM-native
+    and cannot substitute.
 
     Parameters
     ----------
@@ -592,7 +613,12 @@ def update_electrodes_table_locations_from_ibl_app(
     Raises
     ------
     FileNotFoundError
-        If any probe folder lacks ``ccf_channel_locations.json``.
+        If any probe folder holds no ``ccf_channel_locations*.json``.
+    KeyError
+        If the electrodes table has no ``rel_x``/``rel_y`` to match on.
+    ValueError
+        If one probe's files describe the same contact twice, which would fan
+        out the electrodes table on merge.
     """
 
 
@@ -602,7 +628,15 @@ def update_electrodes_table_locations_from_ibl_app(
     # Get the electrodes table
     electrodes = ephys_nwb.electrodes.to_dataframe()
 
-    electrode_names = os.listdir(ibl_annotations_path)
+    absent = [c for c in CCF_CONTACT_KEY_NWB if c not in electrodes.columns]
+    if absent:
+        raise KeyError(
+            f"Electrodes table has no {absent}; contacts are matched to the "
+            "alignment output by probe-face position, so the merge cannot "
+            "proceed without it."
+        )
+
+    electrode_names = sorted(os.listdir(ibl_annotations_path))
 
     annotation, structures = _load_ccf_reference(ccf_root)
     # Index order is PIR (asserted at load), so index * spacing is PIR microns.
@@ -619,15 +653,26 @@ def update_electrodes_table_locations_from_ibl_app(
     outside_by_probe = {}
 
     for elect in electrode_names:
-        ccf_path = os.path.join(ibl_annotations_path, elect, CCF_CHANNEL_LOCATIONS)
-        if not os.path.isfile(ccf_path):
+        # Sorted so shank order is stable in logs; the merge itself is
+        # order-independent.
+        ccf_paths = sorted(
+            Path(ibl_annotations_path, elect).glob(CCF_CHANNEL_LOCATIONS_GLOB)
+        )
+        if not ccf_paths:
             missing.append(elect)
             continue
 
-        with open(ccf_path, 'r') as O:
-            ccf_json = json.load(O)
+        outside_by_probe[elect] = [0, 0]
+        ccf_json = {}
+        for ccf_path in ccf_paths:
+            with open(ccf_path, 'r') as handle:
+                # Shank files repeat channel_0, so key by file to keep them
+                # distinct; only lateral/axial identify a contact.
+                ccf_json.update(
+                    {(ccf_path.name, k): v for k, v in json.load(handle).items()}
+                )
 
-        outside_by_probe[elect] = [0, len(ccf_json)]
+        outside_by_probe[elect][1] = len(ccf_json)
         for channel_id in ccf_json:
             channel = ccf_json[channel_id]
             # The GUI writes ITK world coordinates -- LPS millimetres in the CCF
@@ -650,7 +695,10 @@ def update_electrodes_table_locations_from_ibl_app(
 
             rows.append({
                 'group_name': elect,
-                'channel_name': 'CH' + channel_id.split('_')[-1],
+                '_key_x': round(float(channel[CCF_CONTACT_KEY_JSON[0]]),
+                                CCF_CONTACT_KEY_DECIMALS),
+                '_key_y': round(float(channel[CCF_CONTACT_KEY_JSON[1]]),
+                                CCF_CONTACT_KEY_DECIMALS),
                 # PIR micrometres from the volume's anterior-superior-left
                 # corner. Position in the atlas box only -- the brain floats
                 # inside it, so positive says nothing about being in tissue.
@@ -664,7 +712,7 @@ def update_electrodes_table_locations_from_ibl_app(
     if missing:
         raise FileNotFoundError(
             f"{len(missing)} probe folder(s) under {ibl_annotations_path} have no "
-            f"{CCF_CHANNEL_LOCATIONS}: {sorted(missing)}. CCF coordinates come from "
+            f"{CCF_CHANNEL_LOCATIONS_GLOB}: {sorted(missing)}. CCF coordinates come from "
             "the alignment GUI's own warp; there is no way to derive them here. "
             "Re-export the alignment for these probes."
         )
@@ -689,33 +737,66 @@ def update_electrodes_table_locations_from_ibl_app(
 
     # Explicit columns so an empty ``rows`` still yields a frame the merge can
     # join against instead of raising KeyError on the missing keys.
-    df = pd.DataFrame(rows, columns=['group_name', 'channel_name',
-                                     'ccf_ml', 'ccf_ap', 'ccf_dv',
-                                     'ccf_id', 'ccf_acronym', 'ccf_name',
-                                     'ccf_structure_id_path'])
+    join_on = ['group_name', '_key_x', '_key_y']
+    df = pd.DataFrame(rows, columns=join_on + ['ccf_ml', 'ccf_ap', 'ccf_dv',
+                                               'ccf_id', 'ccf_acronym',
+                                               'ccf_name',
+                                               'ccf_structure_id_path'])
 
-    # # Rename electrodes to match the units ephys
-    # F = {'-1-1':'-2','-1-2':'-3','-1-3':'-4',}
-    # for xx,findkey in enumerate(F.keys()):
-    #     chngkey = F[findkey]
-    #     for ii,isin in enumerate([findkey in x for x in df.group_name]):
-    #         if isin:
-    #             this_loc = df.group_name.loc[ii]
-    #             df.group_name.loc[ii] = this_loc.split(findkey)[0]+chngkey
-    
+    # A repeated contact would silently multiply the electrodes table: pandas
+    # emits one output row per match, so every duplicate fans an electrode out.
+    repeated = df[df.duplicated(subset=join_on, keep=False)]
+    if not repeated.empty:
+        offenders = sorted(set(repeated['group_name']))
+        raise ValueError(
+            f"Alignment output describes the same contact more than once for "
+            f"probe(s) {offenders} ({len(repeated)} row(s)). Merging would "
+            "duplicate electrodes."
+        )
+
+    keyed = electrodes.assign(**{
+        '_key_x': electrodes[CCF_CONTACT_KEY_NWB[0]].round(
+            CCF_CONTACT_KEY_DECIMALS),
+        '_key_y': electrodes[CCF_CONTACT_KEY_NWB[1]].round(
+            CCF_CONTACT_KEY_DECIMALS),
+    })
+
     merged = pd.merge(
-        electrodes,
+        keyed,
         df,
-        on=["group_name", "channel_name"],
+        on=join_on,
         how="left",
         suffixes=("_electrodes", "_df"),
-    ).drop(columns=["location"], errors="ignore")  # drop the metadata-derived one
+    ).drop(columns=join_on[1:] + ["location"],  # keep group_name
+           errors="ignore")  # drop the metadata-derived location
+
+    _log_ccf_coverage(merged)
 
     # NWB requires ``location``; the ``ccf_*`` columns are the authoritative
     # ones. NaN here is resolved by ``_safe_location`` at write time.
     merged["location"] = merged["ccf_acronym"]
 
     return merged
+
+
+def _log_ccf_coverage(merged):
+    """Report electrode groups the alignment output did not cover.
+
+    An unmatched group leaves a block of NaN CCF columns and no error, which
+    reads downstream like "outside the brain" rather than "never aligned".
+    """
+    for group, ccf_ml in merged.groupby('group_name')['ccf_ml']:
+        unmatched = int(ccf_ml.isna().sum())
+        if unmatched == len(ccf_ml):
+            logger.warning(
+                "electrode group %s: no alignment; its %d channel(s) have no "
+                "CCF coordinates", group, unmatched,
+            )
+        elif unmatched:
+            logger.warning(
+                "electrode group %s: %d/%d channel(s) matched no contact in "
+                "the alignment output", group, unmatched, len(ccf_ml),
+            )
 
 
 # Some ChatGPT code to save the new electrodes table
