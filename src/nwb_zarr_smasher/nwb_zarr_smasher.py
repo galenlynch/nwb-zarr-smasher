@@ -799,6 +799,21 @@ def _log_ccf_coverage(merged):
             )
 
 
+def _fill_missing(value, fill):
+    """Replace a missing scalar with ``fill``; non-scalars pass through.
+
+    pynwb's docval silently drops ``None`` kwargs, so an unfilled missing value
+    omits that column for the row and ``add_electrode`` then fails with
+    "column '<name>' missing" -- naming a column that is present on every other
+    row, which reads like a schema fault rather than one absent cell.
+    """
+    try:
+        missing = bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return value  # arrays and anything else without a scalar truth value
+    return fill if missing else value
+
+
 # Some ChatGPT code to save the new electrodes table
 def _safe_location(row, group_obj):
     # 1) if merged has a non-empty location, use it
@@ -872,11 +887,22 @@ def replace_electrodes_table_with_merged(nwb_path: str,
             # This implicitly creates a new empty ElectrodeTable, since it was just removed
             nwb.add_electrode_column(name=col, description=f"{col} from merged")
 
+        # Missing values are routine here, from two directions: a channel on CCF
+        # background has no acronym or structure path, and the left join leaves
+        # a whole block of NaN for any electrode the alignment never covered.
+        # Both must be filled before add_electrode -- see ``_fill_missing``.
+        # Fill per column so dtypes stay clean: '' for text, NaN for numbers.
+        fill_values = {
+            c: (np.nan if pd.api.types.is_numeric_dtype(merged[c]) else "")
+            for c in dynamic_cols
+        }
+
         # --- 3) Add rows (must provide keys for *all* known columns each time)
         for _, row in merged.iterrows():
             group_obj = gmap[str(row["group_name"])]
 
-            row_kwargs = {c: row[c] for c in dynamic_cols}  # dynamic columns
+            row_kwargs = {c: _fill_missing(row[c], fill_values[c])
+                          for c in dynamic_cols}  # dynamic columns
 
             # Standard optionals (always provide)
             row_kwargs["x"] = float(row["x"]) if "x" in merged.columns and pd.notna(row["x"]) else np.nan
