@@ -44,7 +44,7 @@ dependencies = [
   "aind-ephys-utils",
 
   # ---- tooling with known constraints ----
-  "open-ephys-python-tools<0.6.0",
+  "open-ephys-python-tools<1.1.0",
   "pydantic-yaml<1.4",
 
   # ---- misc scientific ----
