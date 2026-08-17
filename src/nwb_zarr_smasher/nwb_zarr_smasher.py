@@ -1050,6 +1050,62 @@ def add_units_locations_from_electrodes_zarr(
             out_cols.append(c)
     return out[out_cols]
 
+def resolve_source_nwb(
+    data_folder,
+    ephys_sorted_name,
+    experiment,
+    recording,
+):
+    """Locate the sorted asset's source NWB for one experiment/recording.
+
+    The filename prefix is globbed rather than rebuilt from
+    ``ephys_sorted_name``, because the two disagree whenever an asset is named
+    for its upload date while the NWBs inside carry the acquisition date. For
+    example ``ecephys_771432_2025-05-07_18-22-06_sorted_...`` holds
+    ``ecephys_771432_2025-03-07_18-22-06_experiment1_recording1.nwb``.
+
+    Falls back to the reconstructed name when nothing matches, so a miss still
+    surfaces as a plain missing-file error naming the path that was expected.
+
+    Parameters
+    ----------
+    data_folder : Path or str
+        Mount root holding the sorted asset.
+    ephys_sorted_name : str
+        Sorted asset folder name.
+    experiment, recording : int or str
+        Open Ephys experiment and recording numbers.
+
+    Returns
+    -------
+    Path
+        Path of the source NWB.
+
+    Raises
+    ------
+    ValueError
+        If several NWBs match and none carries the reconstructed name.
+    """
+    nwb_dir = Path(data_folder) / ephys_sorted_name / "nwb"
+    suffix = f"_experiment{experiment}_recording{recording}.nwb"
+    expected = nwb_dir / f"{ephys_sorted_name.split('_sorted')[0]}{suffix}"
+
+    if not nwb_dir.is_dir():
+        return expected
+    matches = sorted(nwb_dir.glob(f"*{suffix}"))
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        return expected
+    if expected in matches:
+        return expected
+    raise ValueError(
+        f"Several NWBs in {nwb_dir} match experiment{experiment}/"
+        f"recording{recording} and none is named {expected.name}: "
+        f"{[p.name for p in matches]}"
+    )
+
+
 def smash_nwb(
     ephys_sorted_name: str,
     beh_json: Union[str, os.PathLike],
@@ -1119,7 +1175,9 @@ def smash_nwb(
     ephys_base_name = ephys_sorted_name.split("_sorted")[0]
     ephys_raw_folder = data_folder / ephys_base_name
 
-    nwb_loc = data_folder / ephys_sorted_name / "nwb" / f"{ephys_base_name}_experiment{experiment}_recording{recording}.nwb"
+    nwb_loc = resolve_source_nwb(
+        data_folder, ephys_sorted_name, experiment, recording
+    )
 
     now = datetime.datetime.now(ZoneInfo("America/Los_Angeles"))
     date_time = now.strftime("%Y-%m-%d_%H-%M-%S")
