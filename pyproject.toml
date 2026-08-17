@@ -6,7 +6,8 @@ build-backend = "setuptools.build_meta"
 name = "nwb-zarr-smasher"
 description = "Generated from aind-library-template"
 license = { text = "MIT" }
-requires-python = ">=3.10"
+# dynamic-foraging-task requires >=3.11, so >=3.10 makes the tree unresolvable.
+requires-python = ">=3.11"
 authors = [{ name = "Allen Institute for Neural Dynamics" }]
 classifiers = ["Programming Language :: Python :: 3"]
 readme = "README.md"
@@ -30,9 +31,13 @@ dependencies = [
   "wavpack-numcodecs",
 
   # ---- git / source installs ----
-  "ndx-pose @ git+https://github.com/rly/ndx-pose.git",
-  "dynamic-foraging-task @ git+https://github.com/AllenNeuralDynamics/dynamic-foraging-task.git",
   "harp-python @ git+https://github.com/jsiegle/harp-python@decode-clock",
+
+  # dynamic-foraging-task and ndx-pose are deliberately absent: the former pins
+  # the unpublished stagewidget==1.0.5 and pynwb<3, which cannot co-resolve with
+  # the latter's pynwb>=4. Both are installed with --no-deps in the capsule's
+  # environment/postInstall; only foraging_gui.TransferToNWB is used. Listing
+  # them here makes the tree unresolvable for everyone.
 
   # ---- AIND utilities ----
   "aind_dynamic_foraging_data_utils",
@@ -54,6 +59,7 @@ dev = [
   "flake8",
   "interrogate",
   "isort",
+  "pytest",
   "Sphinx",
   "furo",
 ]
@@ -66,7 +72,7 @@ version = { attr = "nwb_zarr_smasher.__version__" }
 
 [tool.black]
 line-length = 79
-target_version = ["py310"]
+target_version = ["py311"]
 exclude = '''
 (
   /(
