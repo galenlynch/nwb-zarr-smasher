@@ -40,6 +40,7 @@ from pynwb.file import Subject
 from pynwb.file import ElectrodeTable
 
 import json
+import re
 from pynwb.core import DynamicTable, VectorData
 from pynwb import TimeSeries
 
@@ -58,10 +59,15 @@ import SimpleITK as sitk
 #: Per-probe files the IBL alignment GUI writes with each channel already warped
 #: into CCF. A stream carrying several shanks is written one file per shank,
 #: suffixed ``_shank1``..``_shankN``; a single-shank stream gets the bare name.
-#: Both land in the same probe directory and merge into one electrode group. The
-#: GUI's companion ``channel_locations.json`` is SPIM-native and is deliberately
-#: not read here -- see :func:`update_electrodes_table_locations_from_ibl_app`.
+#: Both land in the same probe directory, but a sorted multi-shank stream is
+#: split into one electrode group per shank, so the files do not all belong to
+#: one group -- see :func:`electrode_group_for_shank`. The GUI's companion
+#: ``channel_locations.json`` is SPIM-native and is deliberately not read here
+#: -- see :func:`update_electrodes_table_locations_from_ibl_app`.
 CCF_CHANNEL_LOCATIONS_GLOB = 'ccf_channel_locations*.json'
+
+#: Shank suffix on a per-shank alignment file, 1-based.
+CCF_SHANK_SUFFIX = re.compile(r'_shank(\d+)\.json$')
 
 #: Probe-face coordinates, in micrometres, used to identify a contact. The GUI
 #: writes them as ``lateral``/``axial``; the electrodes table calls the same two
@@ -569,6 +575,42 @@ def _ccf_structure_at(annotation, structures, continuous_index_pir):
     return fields, inside
 
 
+def electrode_group_for_shank(elect, ccf_name, known_groups):
+    """Electrode group a per-shank alignment file belongs to.
+
+    A multi-shank stream is one probe folder in the alignment output but
+    several electrode groups in the sorted NWB, and the two sides name the
+    shanks differently. The GUI writes 1-based ``_shank<N>`` file suffixes;
+    the NWB carries either ``<probe>_group<N-1>`` (spikeinterface's
+    ``split_by("group")``) or ``<probe>-<N>``. Both are in circulation, so the
+    candidate that actually exists in the table decides rather than a
+    convention picked here.
+
+    Parameters
+    ----------
+    elect : str
+        Probe folder name in the alignment output.
+    ccf_name : str
+        File name of one ``ccf_channel_locations*.json``.
+    known_groups : container of str
+        Electrode group names present in the NWB's electrodes table.
+
+    Returns
+    -------
+    str
+        Electrode group name, falling back to *elect* so an unmatched shank
+        surfaces as a normal empty join rather than an invented group.
+    """
+    match = CCF_SHANK_SUFFIX.search(ccf_name)
+    if match is None:
+        return elect
+    shank = int(match.group(1))
+    for candidate in (f"{elect}_group{shank - 1}", f"{elect}-{shank}"):
+        if candidate in known_groups:
+            return candidate
+    return elect
+
+
 def update_electrodes_table_locations_from_ibl_app(
     nwb_output_path, ibl_annotations_path, ccf_root=DEFAULT_CCF_ROOT
 ):
@@ -637,6 +679,7 @@ def update_electrodes_table_locations_from_ibl_app(
         )
 
     electrode_names = sorted(os.listdir(ibl_annotations_path))
+    known_groups = set(electrodes['group_name'])
 
     annotation, structures = _load_ccf_reference(ccf_root)
     # Index order is PIR (asserted at load), so index * spacing is PIR microns.
@@ -664,7 +707,11 @@ def update_electrodes_table_locations_from_ibl_app(
 
         outside_by_probe[elect] = [0, 0]
         ccf_json = {}
+        group_by_file = {}
         for ccf_path in ccf_paths:
+            group_by_file[ccf_path.name] = electrode_group_for_shank(
+                elect, ccf_path.name, known_groups
+            )
             with open(ccf_path, 'r') as handle:
                 # Shank files repeat channel_0, so key by file to keep them
                 # distinct; only lateral/axial identify a contact.
@@ -694,7 +741,7 @@ def update_electrodes_table_locations_from_ibl_app(
                 outside_by_probe[elect][0] += 1
 
             rows.append({
-                'group_name': elect,
+                'group_name': group_by_file[channel_id[0]],
                 '_key_x': round(float(channel[CCF_CONTACT_KEY_JSON[0]]),
                                 CCF_CONTACT_KEY_DECIMALS),
                 '_key_y': round(float(channel[CCF_CONTACT_KEY_JSON[1]]),
