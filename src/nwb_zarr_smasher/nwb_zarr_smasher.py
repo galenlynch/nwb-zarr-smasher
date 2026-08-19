@@ -96,6 +96,17 @@ CCF_INDEX_ORIENTATION = 'PIR'
 #: label meaning "in the brain but unassigned", and is not this.
 CCF_ID_NO_STRUCTURE = 0
 
+#: Shank identifier on the units side: ``group<N>`` or a bare number, both
+#: 0-based. A shank read out of a float column arrives as ``0.0``.
+UNIT_SHANK_NUMBER = re.compile(r'^(?:group)?(\d+)(?:\.0+)?$')
+
+#: Units column recording which electrode group each unit's extremum channel
+#: was matched to. Written so the join stays auditable and consumers need not
+#: rediscover it. ``device_name`` is deliberately left as the source packaging
+#: wrote it: it is the units table's only pointer back to the raw stream, and
+#: :func:`update_units_table_timestamps` walks it to find the sorted folder.
+UNIT_ELECTRODE_GROUP_COL = 'electrode_group'
+
 
 # --- IO helpers (Zarr vs HDF5, and clean copy) ---
 def _norm_mode(mode: str) -> str:
@@ -611,6 +622,56 @@ def electrode_group_for_shank(elect, ccf_name, known_groups):
     return elect
 
 
+def electrode_group_for_unit(device, shank, known_groups):
+    """Electrode group a unit's extremum channel belongs to.
+
+    The two tables need not spell a multi-shank probe the same way. The
+    electrodes table splits it into one group per shank --
+    ``<probe>_group<N>`` from spikeinterface's ``split_by("group")``, or
+    ``<probe>-<N>`` -- while the units table can keep the bare probe name and
+    carry the shank in its own column. Joining on the bare name then matches
+    nothing and the whole probe comes out with no region.
+
+    As in :func:`electrode_group_for_shank`, the candidate that exists in the
+    table decides rather than a convention picked here.
+
+    Parameters
+    ----------
+    device : str
+        Units-table device name.
+    shank : str or int or None
+        Units-table shank, ``group<N>`` or a number, both 0-based. Absent or
+        blank on a probe that is a single electrode group.
+    known_groups : container of str
+        Electrode group names present in the electrodes table.
+
+    Returns
+    -------
+    str
+        Electrode group name, falling back to *device* so an unrecognised
+        shank stays an unmatched row rather than an invented group.
+    """
+    device = str(device)
+    # A device that is already a group name carries its own shank -- the
+    # ``<probe>-<N>`` layout, where the shank is the stream.
+    if device in known_groups:
+        return device
+
+    shank = '' if shank is None else str(shank).strip()
+    if shank == '' or shank.lower() == 'nan':
+        return device
+
+    candidates = [f'{device}_{shank}']
+    match = UNIT_SHANK_NUMBER.match(shank)
+    if match is not None:
+        number = int(match.group(1))
+        candidates += [f'{device}_group{number}', f'{device}-{number + 1}']
+    for candidate in candidates:
+        if candidate in known_groups:
+            return candidate
+    return device
+
+
 def update_electrodes_table_locations_from_ibl_app(
     nwb_output_path, ibl_annotations_path, ccf_root=DEFAULT_CCF_ROOT
 ):
@@ -970,24 +1031,224 @@ def replace_electrodes_table_with_merged(nwb_path: str,
 
         io.write(nwb)
 
-def add_units_locations_from_electrodes_zarr(
-    nwb_zarr_path: str,
+def _log_positional_channel_audit(
+    elec_df, position_col, elec_group_col, elec_channel_index_col,
+    elec_channel_name_col,
+):
+    """Name the groups whose row position is not their channel number.
+
+    Those are the groups a channel-number join misreads: a unit's shank-local
+    index lands on whichever probe-global channel happens to share the number,
+    which yields a plausible and wrong region rather than a blank one. Logged
+    per session because nothing downstream cross-checks a unit's region
+    against its own channel.
+    """
+    if elec_channel_index_col in elec_df.columns:
+        numbers = pd.to_numeric(
+            elec_df[elec_channel_index_col], errors='coerce'
+        )
+    elif elec_channel_name_col in elec_df.columns:
+        numbers = pd.to_numeric(
+            elec_df[elec_channel_name_col].astype(str).str.split('CH').str[-1],
+            errors='coerce',
+        )
+    else:
+        return
+
+    differing = sorted(
+        set(elec_df.loc[numbers != elec_df[position_col], elec_group_col])
+    )
+    if differing:
+        logger.info(
+            "%d electrode group(s) number their channels probe-globally, so "
+            "units address them by position, not by channel number: %s",
+            len(differing), differing,
+        )
+
+
+def _unmatched_units_message(
+    unmatched, elec_df, unit_channel_col, elec_group_col,
+):
+    """Report which units missed, and where it can be told, why.
+
+    Two failures look alike in the merge result: a group name the electrodes
+    table does not have at all, and a unit indexing past the end of its own
+    group's channels.
+    """
+    lines = [f"{len(unmatched)} unit(s) matched no electrode row:"]
+    sizes = elec_df.groupby(elec_group_col).size()
+
+    for group, rows in unmatched.groupby(UNIT_ELECTRODE_GROUP_COL, sort=True):
+        wanted = pd.to_numeric(rows[unit_channel_col], errors='coerce')
+        span = f"{wanted.min()}..{wanted.max()}"
+        if group not in sizes:
+            lines.append(
+                f"  {group}: {len(rows)} unit(s) indexing {span}; no "
+                "electrode group of that name"
+            )
+            continue
+        lines.append(
+            f"  {group}: {len(rows)} unit(s) indexing {span}; the group has "
+            f"{sizes[group]} channel(s)"
+        )
+    return "\n".join(lines)
+
+
+def join_units_to_electrodes(
+    units_df: pd.DataFrame,
+    elec_df: pd.DataFrame,
     *,
     unit_device_col: str = "device_name",
+    unit_shank_col: str = "shank",
     unit_channel_col: str = "extremum_channel_index",
     elec_group_col: str = "group_name",
     elec_channel_index_col: str = "channel_index",
     elec_channel_name_col: str = "channel_name",
-    cols_to_add: Tuple[str, ...] = ("location", "ccf_ml", "ccf_ap", "ccf_dv"),
+) -> pd.DataFrame:
+    """Join each unit to its extremum channel's row in the electrodes table.
+
+    Both halves of the key need reconciling on a probe packaged as one
+    electrode group per shank:
+
+    - the electrodes table puts the shank in the group name while the units
+      table keeps the bare probe name and a separate ``shank`` column -- see
+      :func:`electrode_group_for_unit`;
+    - ``extremum_channel_index`` indexes the channel list the sorter saw for
+      that group, so it addresses the group's electrode rows **by position**.
+      The electrodes' own channel number is probe-global and its per-group
+      ranges overlap, so comparing the two numbers is meaningless: it matches
+      whichever rows happen to share a number and assigns those units the CCF
+      of a different channel.
+
+    Position is read off the electrodes table in its stored order, which is
+    the order the sorter saw the channels in.
+
+    Every unit must match. A left join that fills a whole probe with NaN is a
+    packaging failure, not a data-quality result: consumers that filter by
+    region then drop the probe with no error and no warning.
+
+    Parameters
+    ----------
+    units_df, elec_df : pandas.DataFrame
+        Units and electrodes tables. Neither is modified.
+    unit_shank_col : str
+        Units column holding the shank. Ignored when absent -- a probe
+        packaged as one electrode group has no shank to reconcile.
+    elec_channel_index_col, elec_channel_name_col : str
+        Electrodes columns holding the probe-global channel number. Not part
+        of the key; read only to log which groups it disagrees with.
+
+    Returns
+    -------
+    pandas.DataFrame
+        *units_df* in its original row order with the matched electrode
+        columns, ``UNIT_ELECTRODE_GROUP_COL`` and ``_pos_in_group`` added.
+
+    Raises
+    ------
+    ValueError
+        If a join column is missing, or if any unit matches no electrode row.
+    """
+    units_df = units_df.copy()
+    elec_df = elec_df.copy()
+
+    for col in (unit_device_col, unit_channel_col):
+        if col not in units_df.columns:
+            raise ValueError(f"units is missing required column: '{col}'")
+    if elec_group_col not in elec_df.columns:
+        raise ValueError(
+            f"electrodes is missing required column: '{elec_group_col}'"
+        )
+
+    units_df[unit_device_col] = units_df[unit_device_col].astype(str)
+    units_df[unit_channel_col] = pd.to_numeric(
+        units_df[unit_channel_col], errors="coerce"
+    ).astype("Int64")
+    elec_df[elec_group_col] = elec_df[elec_group_col].astype(str)
+
+    position_col = "_pos_in_group"
+    elec_df[position_col] = (
+        elec_df.groupby(elec_group_col).cumcount().astype("Int64")
+    )
+    _log_positional_channel_audit(
+        elec_df, position_col, elec_group_col, elec_channel_index_col,
+        elec_channel_name_col,
+    )
+
+    known_groups = set(elec_df[elec_group_col])
+    shanks = (
+        units_df[unit_shank_col]
+        if unit_shank_col in units_df.columns
+        else pd.Series("", index=units_df.index)
+    )
+    units_df[UNIT_ELECTRODE_GROUP_COL] = [
+        electrode_group_for_unit(device, shank, known_groups)
+        for device, shank in zip(units_df[unit_device_col], shanks)
+    ]
+
+    # cumcount makes (group, position) unique, so a left merge cannot fan the
+    # units table out and keeps its row order.
+    merged = pd.merge(
+        units_df,
+        elec_df,
+        left_on=[UNIT_ELECTRODE_GROUP_COL, unit_channel_col],
+        right_on=[elec_group_col, position_col],
+        how="left",
+        suffixes=("_units", "_elec"),
+        indicator=True,
+    )
+
+    unmatched = merged[merged["_merge"] == "left_only"]
+    if len(unmatched):
+        raise ValueError(
+            _unmatched_units_message(
+                unmatched, elec_df, unit_channel_col, elec_group_col,
+            )
+        )
+    return merged.drop(columns="_merge")
+
+
+def add_units_locations_from_electrodes_zarr(
+    nwb_zarr_path: str,
+    *,
+    unit_device_col: str = "device_name",
+    unit_shank_col: str = "shank",
+    unit_channel_col: str = "extremum_channel_index",
+    elec_group_col: str = "group_name",
+    elec_channel_index_col: str = "channel_index",
+    elec_channel_name_col: str = "channel_name",
+    cols_to_add: Tuple[str, ...] = (
+        "location", "ccf_ml", "ccf_ap", "ccf_dv", UNIT_ELECTRODE_GROUP_COL,
+    ),
     descriptions: Optional[Dict[str, str]] = None,
     overwrite_existing: bool = True,
 ) -> pd.DataFrame:
-    """
-    Add electrode-derived columns (location/CCF coords) into the NWB units table (Zarr).
+    """Add each unit's electrode-derived location to the units table.
 
-    Join key:
-      units[unit_device_col] + units[unit_channel_col]
-        <-> electrodes[elec_group_col] + electrodes[elec_channel_index_col]
+    Every unit is matched to its extremum channel's electrode row -- see
+    :func:`join_units_to_electrodes`, which raises rather than leave a probe
+    unmatched -- and the columns named in *cols_to_add* are written back into
+    the NWB's units table.
+
+    Parameters
+    ----------
+    nwb_zarr_path : str
+        The merged NWB (hdmf-zarr), opened ``r+``.
+    cols_to_add : tuple of str
+        Electrode columns to copy onto the units. ``location`` and
+        ``UNIT_ELECTRODE_GROUP_COL`` are written as text, the rest as floats.
+    overwrite_existing : bool
+        Whether to replace a column the units table already carries.
+
+    Returns
+    -------
+    pandas.DataFrame
+        The units columns with *cols_to_add* appended.
+
+    Raises
+    ------
+    ValueError
+        If the NWB has no units or electrodes table, or if the join fails.
     """
     if descriptions is None:
         descriptions = {
@@ -995,6 +1256,10 @@ def add_units_locations_from_electrodes_zarr(
             "ccf_ml": "CCF coordinate ML in microns (from electrodes table merge)",
             "ccf_ap": "CCF coordinate AP in microns (from electrodes table merge)",
             "ccf_dv": "CCF coordinate DV in microns (from electrodes table merge)",
+            UNIT_ELECTRODE_GROUP_COL: (
+                "Electrode group holding the unit's extremum channel, the key "
+                "the electrodes table merge was made on"
+            ),
         }
 
     def _to_str_no_nan(x) -> str:
@@ -1016,51 +1281,32 @@ def add_units_locations_from_electrodes_zarr(
         units_df = nwb.units.to_dataframe().copy()
         elec_df = nwb.electrodes.to_dataframe().copy()
 
-        # --- validate join columns ---
-        for col in (unit_device_col, unit_channel_col):
-            if col not in units_df.columns:
-                raise ValueError("units is missing required column: '%s'" % col)
-        if elec_group_col not in elec_df.columns:
-            raise ValueError("electrodes is missing required column: '%s'" % elec_group_col)
+        # Newer source NWBs already annotate units with location/ccf_*. Those
+        # are what this function computes, so drop the units' copy before the
+        # join -- otherwise both sides survive the merge suffixed and nothing
+        # is left under the bare name to write.
+        superseded = [
+            c for c in cols_to_add
+            if c in units_df.columns and c in elec_df.columns
+        ]
+        units_df = units_df.drop(columns=superseded)
 
-        # --- derive channel_index on electrodes if needed ---
-        if elec_channel_index_col not in elec_df.columns:
-            if elec_channel_name_col not in elec_df.columns:
-                raise ValueError(
-                    "electrodes is missing '%s' and cannot derive it (also missing '%s')."
-                    % (elec_channel_index_col, elec_channel_name_col)
-                )
-            elec_df[elec_channel_index_col] = [
-                int(str(x).split("CH")[-1]) for x in elec_df[elec_channel_name_col].values
-            ]
-
-        # --- normalize join-key types ---
-        units_df[unit_device_col] = units_df[unit_device_col].astype(str)
-        units_df[unit_channel_col] = pd.to_numeric(units_df[unit_channel_col], errors="coerce").astype("Int64")
-
-        elec_df[elec_group_col] = elec_df[elec_group_col].astype(str)
-        elec_df[elec_channel_index_col] = pd.to_numeric(elec_df[elec_channel_index_col], errors="coerce").astype("Int64")
-
-        # --- preserve unit order robustly ---
-        units_df = units_df.copy()
-        units_df["__unit_row_index__"] = np.arange(len(units_df), dtype=np.int64)
-
-        merged = pd.merge(
+        merged = join_units_to_electrodes(
             units_df,
             elec_df,
-            left_on=[unit_device_col, unit_channel_col],
-            right_on=[elec_group_col, elec_channel_index_col],
-            how="left",
-            suffixes=("_units", "_elec"),
+            unit_device_col=unit_device_col,
+            unit_shank_col=unit_shank_col,
+            unit_channel_col=unit_channel_col,
+            elec_group_col=elec_group_col,
+            elec_channel_index_col=elec_channel_index_col,
+            elec_channel_name_col=elec_channel_name_col,
         )
-
-        merged = merged.sort_values("__unit_row_index__", kind="stable")
         n_units = len(merged)
 
         def _prep_col(col: str):
             if col not in merged.columns:
                 raise ValueError("After merge, column '%s' not found in merged DataFrame." % col)
-            if col == "location":
+            if col in ("location", UNIT_ELECTRODE_GROUP_COL):
                 vals = merged[col].map(_to_str_no_nan).to_numpy(dtype="U")
             else:
                 vals = pd.to_numeric(merged[col], errors="coerce").to_numpy(dtype=float)
@@ -1089,13 +1335,12 @@ def add_units_locations_from_electrodes_zarr(
         io.write(nwb)
 
     # convenience return (units columns + requested new cols)
-    out = merged.drop(columns=["__unit_row_index__"], errors="ignore")
-    # keep original units col order first, then add cols_to_add if present
-    out_cols = [c for c in units_df.columns if c != "__unit_row_index__" and c in out.columns]
+    out_cols = [c for c in units_df.columns if c in merged.columns]
     for c in cols_to_add:
-        if c in out.columns and c not in out_cols:
+        if c in merged.columns and c not in out_cols:
             out_cols.append(c)
-    return out[out_cols]
+    return merged[out_cols]
+
 
 def resolve_source_nwb(
     data_folder,
